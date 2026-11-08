@@ -10,7 +10,6 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets
-from torchvision.transforms import v2
 
 from . import config
 
@@ -108,33 +107,79 @@ def compute_channel_mean_std(images_uint8: torch.Tensor):
 # ---------------------------------------------------------------------------
 # 4. Dataset и аугментация
 # ---------------------------------------------------------------------------
-def build_augmentation():
-    """Аугментация имитирует реальные условия съёмки: небольшой поворот камеры,
-    смещение и масштаб знака в кадре, разное освещение.
+class GpuAugmentation(torch.nn.Module):
+    """Аугментация пакета изображений прямо на видеокарте (для каждого изображения
+    свои случайные параметры). Имитирует реальные условия съёмки: небольшой поворот
+    камеры, смещение и масштаб знака в кадре, разное освещение и контраст.
+
     Горизонтальное отражение НЕ используется: «поворот налево» после отражения
-    превратился бы в «поворот направо» — это сменило бы класс."""
-    return v2.Compose([
-        v2.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-        v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3),
-    ])
+    превратился бы в «поворот направо» — это сменило бы класс.
+
+    Изначально аугментация выполнялась на процессоре по одному изображению
+    (torchvision), и эпоха обучения замедлялась примерно в 10 раз; перенос на GPU
+    убирает это узкое место.
+
+    На вход и выход — стандартизированные изображения (как их выдаёт TrafficSignDataset)."""
+
+    def __init__(self, mean, std, degrees=10.0, translate=0.1, scale=(0.9, 1.1),
+                 brightness=0.4, contrast=0.4):
+        super().__init__()
+        self.register_buffer("mean", torch.tensor(mean).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor(std).view(1, 3, 1, 1))
+        self.degrees, self.translate, self.scale = degrees, translate, scale
+        self.brightness, self.contrast = brightness, contrast
+
+    def forward(self, x):
+        n, device = x.size(0), x.device
+        raw = x * self.std + self.mean                         # обратно к значениям 0..1
+        # --- геометрия: аффинное преобразование для каждого изображения ---
+        angle = (torch.rand(n, device=device) * 2 - 1) * self.degrees * np.pi / 180
+        scale = torch.empty(n, device=device).uniform_(*self.scale)
+        shift = (torch.rand(n, 2, device=device) * 2 - 1) * self.translate * 2  # координаты сетки в [-1, 1]
+        cos, sin = torch.cos(angle) / scale, torch.sin(angle) / scale
+        theta = torch.stack([torch.stack([cos, -sin, shift[:, 0]], dim=1),
+                             torch.stack([sin, cos, shift[:, 1]], dim=1)], dim=1)
+        grid = torch.nn.functional.affine_grid(theta, raw.shape, align_corners=False)
+        raw = torch.nn.functional.grid_sample(raw, grid, padding_mode="zeros", align_corners=False)
+        # --- освещение: яркость и контраст ---
+        b = torch.empty(n, 1, 1, 1, device=device).uniform_(1 - self.brightness, 1 + self.brightness)
+        c = torch.empty(n, 1, 1, 1, device=device).uniform_(1 - self.contrast, 1 + self.contrast)
+        raw = raw * b
+        gray_mean = raw.mean(dim=(1, 2, 3), keepdim=True)
+        raw = ((raw - gray_mean) * c + gray_mean).clamp(0, 1)
+        return (raw - self.mean) / self.std
+
+
+def augment_single_image(augmentation: GpuAugmentation, image_uint8: torch.Tensor) -> torch.Tensor:
+    """Применяет аугментацию к одному изображению uint8 (для иллюстраций в отчёте)."""
+    mean, std = augmentation.mean.cpu(), augmentation.std.cpu()
+    x = (image_uint8.float().div(255.0).unsqueeze(0) - mean) / std
+    with torch.no_grad():
+        y = augmentation.cpu()(x)
+    return ((y * std + mean).clamp(0, 1)[0] * 255).round().to(torch.uint8)
+
+
+def class_weights(labels: torch.Tensor, num_classes: int = config.NUM_CLASSES) -> torch.Tensor:
+    """Веса классов для функции потерь: w_c = N / (K * n_c).
+    Редкие классы получают больший вес, частые — меньший; средний вес примера равен 1."""
+    counts = torch.bincount(labels, minlength=num_classes).float()
+    return len(labels) / (num_classes * counts.clamp(min=1))
 
 
 class TrafficSignDataset(Dataset):
-    def __init__(self, images_uint8, labels, mean, std, augmentation=None):
+    """Возвращает стандартизированное изображение и номер класса."""
+
+    def __init__(self, images_uint8, labels, mean, std):
         self.images = images_uint8
         self.labels = labels
         self.mean = torch.tensor(mean).view(3, 1, 1)
         self.std = torch.tensor(std).view(3, 1, 1)
-        self.augmentation = augmentation
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, index):
-        image = self.images[index]
-        if self.augmentation is not None:
-            image = self.augmentation(image)
-        image = image.float().div(255.0)
+        image = self.images[index].float().div(255.0)
         image = (image - self.mean) / self.std   # стандартизация каналов
         return image, self.labels[index]
 

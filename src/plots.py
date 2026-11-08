@@ -99,13 +99,13 @@ def plot_before_after_normalization(raw_uint8, normalized, filename="05_before_a
     _save(fig, filename)
 
 
-def plot_augmentation_examples(images_uint8, augmentation, indices, filename="06_augmentation.png"):
+def plot_augmentation_examples(images_uint8, augment_fn, indices, filename="06_augmentation.png"):
     fig, axes = plt.subplots(len(indices), 6, figsize=(9, 1.6 * len(indices)), squeeze=False)
     for row, index in enumerate(indices):
         axes[row, 0].imshow(to_displayable(images_uint8[index]))
         axes[row, 0].set_title("Исходное" if row == 0 else "", fontsize=8)
         for col in range(1, 6):
-            axes[row, col].imshow(to_displayable(augmentation(images_uint8[index])))
+            axes[row, col].imshow(to_displayable(augment_fn(images_uint8[index])))
             if row == 0:
                 axes[row, col].set_title(f"Аугментация {col}", fontsize=8)
         for ax in axes[row]:
@@ -221,13 +221,13 @@ def plot_misclassified(images_uint8, y_true, y_pred, probs, n=24, filename="23_m
     wrong = wrong[np.argsort(-probs[wrong, y_pred[wrong]])][:n]
     cols = 6
     rows = int(np.ceil(len(wrong) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(14, 2.6 * rows))
+    fig, axes = plt.subplots(rows, cols, figsize=(15, 3.1 * rows))
     for ax in np.atleast_1d(axes).flat:
         ax.axis("off")
     for ax, index in zip(np.atleast_1d(axes).flat, wrong):
         ax.imshow(to_displayable(images_uint8[index]))
         ax.set_title(f"Истина: {config.CLASS_NAMES_RU[y_true[index]]}\n"
                      f"Модель: {config.CLASS_NAMES_RU[y_pred[index]]} ({probs[index, y_pred[index]]:.0%})",
-                     fontsize=7)
+                     fontsize=6.5)
     fig.suptitle("Примеры ошибок модели на тестовой выборке (наиболее уверенные ошибки)")
     _save(fig, filename)

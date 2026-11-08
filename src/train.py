@@ -30,11 +30,13 @@ def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def train_one_epoch(model, loader, optimizer, loss_fn, device):
+def train_one_epoch(model, loader, optimizer, loss_fn, device, augmentation=None):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     for images, labels in loader:
         images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        if augmentation is not None:
+            images = augmentation(images)
         optimizer.zero_grad()
         logits = model(images)
         loss = loss_fn(logits, labels)
@@ -68,12 +70,17 @@ def evaluate(model, loader, loss_fn, device, return_outputs: bool = False):
 
 
 def fit(model, train_loader, validation_loader, epochs=config.EPOCHS, lr=config.LEARNING_RATE,
-        weight_decay=0.0, scheduler: str | None = None, device=None, verbose=True):
+        weight_decay=0.0, scheduler: str | None = None, augmentation=None, loss_weights=None,
+        device=None, verbose=True):
     """Обучает модель оптимизатором Adam. Возвращает историю обучения.
     В конце в модель загружаются веса эпохи с лучшей точностью на валидации."""
     device = device or get_device()
     model.to(device)
-    loss_fn = nn.CrossEntropyLoss()
+    if augmentation is not None:
+        augmentation.to(device)
+    train_loss_fn = nn.CrossEntropyLoss(
+        weight=loss_weights.to(device) if loss_weights is not None else None)
+    loss_fn = nn.CrossEntropyLoss()   # на валидации — обычная (невзвешенная) кросс-энтропия
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     lr_scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
                     if scheduler == "cosine" else None)
@@ -83,7 +90,8 @@ def fit(model, train_loader, validation_loader, epochs=config.EPOCHS, lr=config.
     best_accuracy, best_state = -1.0, None
     for epoch in range(1, epochs + 1):
         start = time.perf_counter()
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, loss_fn, device)
+        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, train_loss_fn,
+                                                device, augmentation)
         if device.type == "cuda":
             torch.cuda.synchronize()
         epoch_time = time.perf_counter() - start
@@ -109,23 +117,27 @@ def fit(model, train_loader, validation_loader, epochs=config.EPOCHS, lr=config.
 
 def run_experiment(name: str, train_loader, validation_loader, model_kwargs: dict,
                    epochs=config.EPOCHS, lr=config.LEARNING_RATE, weight_decay=0.0,
-                   scheduler=None, seed=config.SEED, verbose=False):
+                   scheduler=None, augmentation=None, loss_weights=None,
+                   seed=config.SEED, verbose=False):
     """Один эксперимент: фиксируем seed, создаём модель, обучаем, сохраняем историю в JSON."""
     set_seed(seed)
     model = TrafficSignCNN(**model_kwargs)
     print(f"\n=== {name} | параметров: {count_parameters(model):,} ===")
     history = fit(model, train_loader, validation_loader, epochs=epochs, lr=lr,
-                  weight_decay=weight_decay, scheduler=scheduler, verbose=verbose)
+                  weight_decay=weight_decay, scheduler=scheduler, augmentation=augmentation,
+                  loss_weights=loss_weights, verbose=verbose)
     summary = {
         "name": name,
         "model_kwargs": model_kwargs,
-        "augmentation": getattr(train_loader.dataset, "augmentation", None) is not None,
+        "augmentation": augmentation is not None,
+        "class_weights": loss_weights is not None,
         "epochs": epochs, "lr": lr, "weight_decay": weight_decay, "scheduler": scheduler,
         "parameters": count_parameters(model),
         "best_val_accuracy": history["best_val_accuracy"],
         "best_epoch": history["best_epoch"],
         "final_train_accuracy": history["train_accuracy"][-1],
-        "mean_epoch_time_sec": float(np.mean(history["epoch_time_sec"])),
+        # медиана, а не среднее: первая эпоха дольше из-за «прогрева» видеокарты
+        "mean_epoch_time_sec": float(np.median(history["epoch_time_sec"])),
         "history": history,
     }
     config.EXPERIMENTS_DIR.mkdir(parents=True, exist_ok=True)
